@@ -129,7 +129,7 @@ struct Run {
 }
 
 // Refuse to operate on another service that happens to use our name.
-fn verify_service(service: &Sc, dir: &Path) -> Result<()> {
+fn verify_service(service: &Sc, dir: &Path) -> Result<bool> {
     let mut storage = [0usize; 1024]; // Aligned, 8 KiB QueryServiceConfig buffer.
     let mut needed = 0;
     check(
@@ -154,7 +154,7 @@ fn verify_service(service: &Sc, dir: &Path) -> Result<()> {
     if actual != command(dir) || config.dwServiceType != SERVICE_WIN32_OWN_PROCESS {
         return Err("同名服务不是本工具安装的配置，未修改".into());
     }
-    Ok(())
+    Ok(config.dwStartType != SERVICE_DISABLED)
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -162,6 +162,8 @@ pub struct State {
     pub installed: bool,
     pub paused: bool,
     pub running: bool,
+    pub enabled: bool,
+    pub exit_code: u32,
 }
 pub fn state() -> Result<State> {
     let manager = Sc::manager(SC_MANAGER_CONNECT)?;
@@ -169,7 +171,7 @@ pub fn state() -> Result<State> {
         return Ok(State::default());
     };
     let dir = directory()?;
-    verify_service(&service, &dir)?;
+    let enabled = verify_service(&service, &dir)?;
     let mut status = SERVICE_STATUS::default();
     check(
         unsafe { QueryServiceStatus(service.0, &mut status) },
@@ -180,6 +182,8 @@ pub fn state() -> Result<State> {
         installed: true,
         paused: !running && dir.join(PAUSED).exists(),
         running,
+        enabled,
+        exit_code: status.dwWin32ExitCode,
     })
 }
 

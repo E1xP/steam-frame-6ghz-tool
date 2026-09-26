@@ -3,6 +3,7 @@ use crate::{backend, protocol::Result};
 use std::{
     cell::RefCell,
     fs::{self, File, OpenOptions},
+    hash::{DefaultHasher, Hash, Hasher},
     io::{Read, Write},
     os::windows::{
         fs::{MetadataExt, OpenOptionsExt},
@@ -143,7 +144,7 @@ pub fn read(dir: &Path) -> Result<String> {
     let _directories = lock_directories(dir)?;
     let paths = files(dir)?;
     let mut text = String::new();
-    for path in paths.iter().skip(paths.len().saturating_sub(KEEP_FILES)) {
+    for path in &paths {
         let file = OpenOptions::new()
             .read(true)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
@@ -168,6 +169,25 @@ pub fn read(dir: &Path) -> Result<String> {
             .map_err(|e| e.to_string())?;
     }
     Ok(text)
+}
+
+/// Cheap snapshot key: the UI only reloads text when retained files change.
+pub fn revision(dir: &Path) -> Result<u64> {
+    let mut hash = DefaultHasher::new();
+    dir.hash(&mut hash);
+    if dir.try_exists().map_err(|e| e.to_string())? {
+        let _directories = lock_directories(dir)?;
+        for path in files(dir)? {
+            let metadata = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+            path.hash(&mut hash);
+            metadata.len().hash(&mut hash);
+            metadata
+                .modified()
+                .map_err(|e| e.to_string())?
+                .hash(&mut hash);
+        }
+    }
+    Ok(hash.finish())
 }
 
 #[cfg(test)]
