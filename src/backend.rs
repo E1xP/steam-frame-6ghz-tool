@@ -362,6 +362,12 @@ impl Transport for Driver {
         ));
         check(code, "WlanIhvControl（不自动重发）")?;
         let bytes = protocol::decode(&request, &response, returned as usize)?.to_vec();
+        if command == Command::Country {
+            self.logs.push(format!(
+                "Country payload_len={}, payload_hex={bytes:02X?}",
+                bytes.len()
+            ));
+        }
         Ok(bytes)
     }
 }
@@ -372,13 +378,25 @@ pub struct Report {
     pub uncertain: bool,
 }
 pub fn operate(selected: &Adapter, set_us: bool) -> Report {
-    operate_locked(selected, set_us, DiagnosticLock::acquire())
+    operate_locked(selected, set_us, false, DiagnosticLock::acquire())
 }
 /// None means another instance holds the lock; no device API has been called.
 pub fn try_auto_operate(selected: &Adapter) -> Result<Option<Report>> {
-    Ok(DiagnosticLock::try_acquire()?.map(|guard| operate_locked(selected, true, Ok(guard))))
+    Ok(DiagnosticLock::try_acquire()?.map(|guard| operate_locked(selected, true, true, Ok(guard))))
 }
-fn operate_locked(selected: &Adapter, set_us: bool, guard: Result<DiagnosticLock>) -> Report {
+fn validate_setting_baseline(before: &Status, automatic: bool) -> Result<()> {
+    if before.country_known() || (!automatic && before.country == protocol::UNKNOWN_COUNTRY) {
+        Ok(())
+    } else {
+        Err("国家码未知；自动应用未发送设置请求，请在界面查询后手动确认设置。".into())
+    }
+}
+fn operate_locked(
+    selected: &Adapter,
+    set_us: bool,
+    automatic: bool,
+    guard: Result<DiagnosticLock>,
+) -> Report {
     let mut driver = None;
     let mut lines = vec![format!(
         "{} target={} hardware={} service={} action={}",
@@ -412,6 +430,13 @@ fn operate_locked(selected: &Adapter, set_us: bool, guard: Result<DiagnosticLock
             return Ok(before);
         }
         // No baseline -> no write. Already in the requested state -> no redundant write.
+        validate_setting_baseline(&before, automatic)?;
+        if !before.country_known() {
+            lines.push(
+                "[WARN] 原国家码为 00 00；诊断查询正常，按用户确认仅发送一次设置，并严格复查。"
+                    .into(),
+            );
+        }
         if before.manual_us_supported() {
             lines.push("已经是 US/MANUAL 且 6 GHz 支持；未重复发送设置。".into());
             return Ok(before);
@@ -448,6 +473,20 @@ fn operate_locked(selected: &Adapter, set_us: bool, guard: Result<DiagnosticLock
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_manual_setting_accepts_explicit_unknown_country() {
+        let mut before = Status {
+            country: protocol::UNKNOWN_COUNTRY.into(),
+            info: "[6G Info]\n6G NOT Support".into(),
+        };
+        assert!(validate_setting_baseline(&before, false).is_ok());
+        assert!(validate_setting_baseline(&before, true).is_err());
+        before.country = "CN".into();
+        assert!(validate_setting_baseline(&before, false).is_ok());
+        assert!(validate_setting_baseline(&before, true).is_ok());
+        before.country.clear();
+        assert!(validate_setting_baseline(&before, false).is_err());
+    }
     #[test]
     fn unknown_driver_warns_without_bypassing_device_checks() {
         let pnp = "USB\\VID_28DE&PID_2432\\SERIAL";

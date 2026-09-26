@@ -2,6 +2,7 @@
 use std::{thread, time::Duration};
 
 pub type Result<T> = std::result::Result<T, String>;
+pub const UNKNOWN_COUNTRY: &str = "未知";
 pub const DRIVER_HASH: &str = "378ffaee3b782b9a7f5382c294a846e7c4b3b952717991fd1fd93795c5a85612";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,8 +79,15 @@ pub trait Transport {
 
 pub fn country(t: &mut impl Transport) -> Result<String> {
     let b = t.exchange(Command::Country)?;
+    if b == [0, 0] {
+        // Observed on real hardware. This is not ASCII "00" or a known region.
+        return Ok(UNKNOWN_COUNTRY.into());
+    }
     if b.len() != 2 || !b.iter().all(|c| (32..=126).contains(c)) {
-        return Err("国家码响应无效".into());
+        return Err(format!(
+            "国家码响应无效：payload_len={}，payload_hex={b:02X?}（预期为 2 个可打印 ASCII 字节）",
+            b.len()
+        ));
     }
     Ok(String::from_utf8(b).unwrap())
 }
@@ -152,6 +160,9 @@ pub struct Status {
     pub info: String,
 }
 impl Status {
+    pub fn country_known(&self) -> bool {
+        self.country.len() == 2 && self.country.bytes().all(|b| (32..=126).contains(&b))
+    }
     pub fn manual_us_supported(&self) -> bool {
         self.country == "US"
             && self.info.lines().any(|l| {
@@ -191,7 +202,7 @@ fn set_and_check(t: &mut impl Transport, delay: Duration) -> TestResult {
     if known {
         // Recheck even after an explicit rejection. Never infer success from US alone.
         let after = read_status(t, delay);
-        let uncertain = after.is_err();
+        let uncertain = !after.as_ref().is_ok_and(Status::country_known);
         TestResult {
             reply,
             after,
@@ -220,6 +231,62 @@ mod tests {
         }
         b.extend(text.as_bytes());
         b
+    }
+    #[test]
+    fn invalid_country_reports_bytes_without_relaxing_validation() {
+        struct CountryReply(Vec<u8>);
+        impl Transport for CountryReply {
+            fn exchange(&mut self, command: Command) -> Result<Vec<u8>> {
+                assert_eq!(command, Command::Country);
+                Ok(self.0.clone())
+            }
+        }
+        for (bytes, hex) in [
+            (vec![], "[]"),
+            (vec![0, b'S'], "[00, 53]"),
+            (b"US\0".to_vec(), "[55, 53, 00]"),
+            (vec![0xFF, 0x80], "[FF, 80]"),
+        ] {
+            let len = bytes.len();
+            let error = country(&mut CountryReply(bytes)).unwrap_err();
+            assert!(error.contains(&format!("payload_len={len}")));
+            assert!(error.contains(&format!("payload_hex={hex}")));
+        }
+        assert_eq!(country(&mut CountryReply(b"US".to_vec())).unwrap(), "US");
+        assert_eq!(
+            country(&mut CountryReply(vec![0, 0])).unwrap(),
+            UNKNOWN_COUNTRY
+        );
+    }
+    #[test]
+    fn unknown_country_still_reads_info_and_never_means_success() {
+        struct UnknownCountry(Mock);
+        impl Transport for UnknownCountry {
+            fn exchange(&mut self, command: Command) -> Result<Vec<u8>> {
+                if command == Command::Country {
+                    self.0.commands.push(command);
+                    Ok(vec![0, 0])
+                } else {
+                    self.0.exchange(command)
+                }
+            }
+        }
+        let mut t = UnknownCountry(Mock {
+            commands: vec![],
+            fail: false,
+            reject: false,
+            current: Command::Info,
+        });
+        let status = read_status(&mut t, Duration::ZERO).unwrap();
+        assert_eq!(status.country, UNKNOWN_COUNTRY);
+        assert!(status.info.contains("6G Info"));
+        assert!(!status.country_known());
+        assert!(!status.manual_us_supported());
+        assert!(t.0.commands.contains(&Command::Info));
+        assert!(!t.0.commands.contains(&Command::ManualUs));
+        let result = set_and_check(&mut t, Duration::ZERO);
+        assert!(result.uncertain);
+        assert!(!result.after.unwrap().manual_us_supported());
     }
     #[test]
     fn layouts_and_bounds() {

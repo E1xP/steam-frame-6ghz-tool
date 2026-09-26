@@ -542,6 +542,7 @@ impl App {
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let allowed = selected.as_ref().is_some_and(Adapter::supported)
+                        && self.device_status.is_some()
                         && self.receiver.is_none()
                         && !self.confirming()
                         && !self.uncertain;
@@ -550,6 +551,17 @@ impl App {
                     }
                 });
             });
+            if self
+                .device_status
+                .as_ref()
+                .is_some_and(|s| !s.country_known())
+            {
+                ui.add_space(6.0);
+                ui.colored_label(
+                    AMBER,
+                    "原国家码未知（00 00）。可手动确认设置，完成后将严格复查；自动应用暂不处理此状态。",
+                );
+            }
             if selected
                 .as_ref()
                 .is_some_and(|a| a.supported() && a.unverified_driver)
@@ -720,6 +732,9 @@ impl App {
             egui::Modal::new(egui::Id::new("confirm-us")).frame(card().inner_margin(24.0)).show(ctx, |ui| {
                 ui.set_width(420.0); ui.heading("设置为 US？"); ui.add_space(8.0);
                 ui.label(adapter_label(&adapter, &self.adapters));
+                if self.device_status.as_ref().is_some_and(|s| !s.country_known()) {
+                    ui.colored_label(AMBER, "原国家码未知。确认后仅尝试一次，驱动回复和状态复查均通过才判定成功。");
+                }
                 ui.label("改变适配器运行时策略，可能启用 6 GHz 或短暂影响连接。只提交一次并复查，不自动回滚。");
                 if adapter.unverified_driver { ui.colored_label(AMBER, "此驱动版本未验证，可能不兼容。"); }
                 ui.add_space(12.0);
