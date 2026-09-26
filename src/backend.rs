@@ -305,6 +305,10 @@ pub fn enumerate() -> Result<Vec<Adapter>> {
 struct DiagnosticLock(HANDLE);
 impl DiagnosticLock {
     fn acquire() -> Result<Self> {
+        Self::try_acquire()?
+            .ok_or_else(|| "另一实例正在操作。请关闭其他诊断工具，稍后重试查看状态。".into())
+    }
+    fn try_acquire() -> Result<Option<Self>> {
         // ponytail: one system-wide mutex because this driver uses shared buffers.
         let name: Vec<u16> = "Global\\SteamFrameLabOriginalDriverDiagnosticV1\0"
             .encode_utf16()
@@ -317,9 +321,9 @@ impl DiagnosticLock {
             unsafe {
                 CloseHandle(handle);
             }
-            return Err("另一实例正在操作。请关闭其他诊断工具，稍后重试查看状态。".into());
+            return Ok(None);
         }
-        Ok(Self(handle))
+        Ok(Some(Self(handle)))
     }
 }
 impl Drop for DiagnosticLock {
@@ -368,6 +372,13 @@ pub struct Report {
     pub uncertain: bool,
 }
 pub fn operate(selected: &Adapter, set_us: bool) -> Report {
+    operate_locked(selected, set_us, DiagnosticLock::acquire())
+}
+/// None means another instance holds the lock; no device API has been called.
+pub fn try_auto_operate(selected: &Adapter) -> Result<Option<Report>> {
+    Ok(DiagnosticLock::try_acquire()?.map(|guard| operate_locked(selected, true, Ok(guard))))
+}
+fn operate_locked(selected: &Adapter, set_us: bool, guard: Result<DiagnosticLock>) -> Report {
     let mut driver = None;
     let mut lines = vec![format!(
         "{} target={} hardware={} service={} action={}",
@@ -379,7 +390,7 @@ pub fn operate(selected: &Adapter, set_us: bool) -> Report {
     )];
     let mut uncertain = false;
     let result = (|| {
-        let _guard = DiagnosticLock::acquire()?;
+        let _guard = guard?;
         // Re-enumerate immediately before IHV calls; do not trust an old UI selection.
         let current = enumerate()?
             .into_iter()

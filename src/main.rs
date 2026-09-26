@@ -3,7 +3,9 @@
 compile_error!("This application targets x86_64 Windows only.");
 
 mod backend;
+mod logs;
 mod protocol;
+mod service;
 use backend::{Adapter, Report};
 use eframe::egui;
 use std::{
@@ -14,8 +16,12 @@ use std::{
 };
 
 enum Event {
-    Devices(protocol::Result<Vec<Adapter>>),
+    Devices(
+        protocol::Result<Vec<Adapter>>,
+        protocol::Result<service::State>,
+    ),
     Operation(Report),
+    AutoApply(protocol::Result<String>, protocol::Result<service::State>),
 }
 struct App {
     adapters: Vec<Adapter>,
@@ -26,6 +32,9 @@ struct App {
     confirm: Option<Adapter>,
     uncertain: bool,
     demo: bool,
+    auto_state: Option<service::State>,
+    confirm_auto: Option<bool>,
+    error_popup: Option<String>,
 }
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, demo: bool) -> Self {
@@ -59,12 +68,15 @@ impl App {
             confirm: None,
             uncertain: false,
             demo,
+            auto_state: None,
+            confirm_auto: None,
+            error_popup: None,
         };
         app.record(&format!(
             "Steam Frame 6 GHz 设置工具 {} / Windows x64 / demo={demo}",
             env!("CARGO_PKG_VERSION")
         ));
-        app.record("不扫描、不自动连接、不修改文件或注册表。查看状态会消耗共享诊断缓冲，请关闭其他原厂诊断程序。日志仅保存在内存，需点击保存日志导出。");
+        app.record("不扫描、不自动连接。自动应用默认关闭，需手动确认安装。查看状态会消耗共享诊断缓冲，请关闭其他原厂诊断程序。");
         app.refresh();
         app
     }
@@ -81,12 +93,58 @@ impl App {
         self.receiver = Some(rx);
         let demo = self.demo;
         thread::spawn(move || {
-            let _ = tx.send(Event::Devices(if demo {
+            let devices = if demo {
                 Ok(vec![demo_adapter()])
             } else {
                 backend::enumerate()
-            }));
+            };
+            let auto = if demo {
+                Ok(service::State::default())
+            } else {
+                service::state()
+            };
+            let _ = tx.send(Event::Devices(devices, auto));
         });
+    }
+    fn set_auto(&mut self, install: bool) {
+        self.confirm_auto = None;
+        self.status = if install {
+            "正在开启自动应用…"
+        } else {
+            "正在关闭并卸载自动应用…"
+        }
+        .into();
+        self.record(&self.status.clone());
+        let (tx, rx) = mpsc::channel();
+        self.receiver = Some(rx);
+        let demo = self.demo;
+        thread::spawn(move || {
+            if demo {
+                let _ = tx.send(Event::AutoApply(
+                    Ok("演示模式：未修改系统。".into()),
+                    Ok(service::State {
+                        installed: install,
+                        ..Default::default()
+                    }),
+                ));
+                return;
+            }
+            let result = if install {
+                service::install()
+            } else {
+                service::uninstall()
+            };
+            let _ = tx.send(Event::AutoApply(result, service::state()));
+        });
+    }
+    fn update_auto_state(&mut self, state: protocol::Result<service::State>) {
+        match state {
+            Ok(state) => self.auto_state = Some(state),
+            Err(e) => {
+                self.auto_state = None;
+                self.record(&format!("自动应用状态：{e}"));
+            }
+        }
     }
     fn start(&mut self, adapter: Adapter, set_us: bool) {
         if self.receiver.is_some() {
@@ -137,14 +195,20 @@ impl App {
         }
     }
     fn save(&mut self) {
+        let auto_log = if self.demo {
+            String::new()
+        } else {
+            service::read_log().unwrap_or_else(|e| format!("读取自动日志失败：{e}"))
+        };
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("实验日志", &["txt"])
+            .set_directory(service::log_directory().unwrap_or_default())
             .set_file_name("steam-frame-6ghz-tool-log.txt")
             .save_file()
         {
             let content = format!(
-                "\u{feff}Steam Frame 6 GHz 设置工具 实验日志 (UTC timestamps)\n{}",
-                self.log
+                "\u{feff}Steam Frame 6 GHz 设置工具 实验日志 (UTC timestamps)\n{}\n自动应用日志：\n{}",
+                self.log, auto_log
             );
             match fs::write(&path, content) {
                 Ok(()) => self.record(&format!(
@@ -167,30 +231,52 @@ impl App {
             Some(Ok(event)) => {
                 self.receiver = None;
                 match event {
-                    Event::Devices(result) => match result {
-                        Ok(items) => {
-                            self.status = if items.is_empty() {
-                                "未发现 Steam Frame 适配器，请插入设备后刷新。"
-                            } else {
-                                "请选择适配器。"
+                    Event::Devices(result, auto) => {
+                        self.update_auto_state(auto);
+                        match result {
+                            Ok(items) => {
+                                self.status = if items.is_empty() {
+                                    "未发现 Steam Frame 适配器，请插入设备后刷新。"
+                                } else {
+                                    "请选择适配器。"
+                                }
+                                .into();
+                                for a in &items {
+                                    self.record(&format!(
+                                        "发现 {} [{}] / {} / {:?}",
+                                        a.name, a.id, a.pnp, a.compatibility
+                                    ));
+                                }
+                                self.adapters = items;
+                                if self.adapters.len() == 1 {
+                                    self.select(Some(0));
+                                }
                             }
-                            .into();
-                            for a in &items {
-                                self.record(&format!(
-                                    "发现 {} [{}] / {} / {:?}",
-                                    a.name, a.id, a.pnp, a.compatibility
-                                ));
-                            }
-                            self.adapters = items;
-                            if self.adapters.len() == 1 {
-                                self.select(Some(0));
+                            Err(e) => {
+                                self.record(&format!("枚举失败：{e}"));
+                                self.status = "无法读取适配器，请查看日志。".into();
                             }
                         }
-                        Err(e) => {
-                            self.record(&format!("枚举失败：{e}"));
-                            self.status = "无法读取适配器，请查看日志。".into();
+                    }
+                    Event::AutoApply(result, state) => {
+                        self.update_auto_state(state);
+                        match result {
+                            Ok(message) => {
+                                self.record(&message);
+                                self.status = message;
+                            }
+                            Err(e) => {
+                                self.record(&e);
+                                self.status = if e.starts_with("权限不足") {
+                                    "权限不足，请以管理员身份重新运行。"
+                                } else {
+                                    "自动应用配置失败，请查看错误提示。"
+                                }
+                                .into();
+                                self.error_popup = Some(e);
+                            }
                         }
-                    },
+                    }
                     Event::Operation(report) => {
                         for line in report.logs {
                             self.record(&line);
@@ -224,6 +310,8 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll();
         let busy = self.receiver.is_some();
+        let confirming =
+            self.confirm.is_some() || self.confirm_auto.is_some() || self.error_popup.is_some();
         if busy {
             ctx.request_repaint_after(Duration::from_millis(100));
             if ctx.input(|i| i.viewport().close_requested()) {
@@ -242,7 +330,7 @@ impl eframe::App for App {
                 ui.horizontal(|ui| {
                     ui.label("适配器");
                     if ui
-                        .add_enabled(!busy && self.confirm.is_none(), egui::Button::new("刷新"))
+                        .add_enabled(!busy && !confirming, egui::Button::new("刷新"))
                         .clicked()
                     {
                         self.refresh();
@@ -252,7 +340,7 @@ impl eframe::App for App {
                     }
                 });
                 let mut choice = self.selected;
-                ui.add_enabled_ui(self.receiver.is_none() && self.confirm.is_none(), |ui| {
+                ui.add_enabled_ui(self.receiver.is_none() && !confirming, |ui| {
                     egui::ComboBox::from_id_salt("adapter")
                         .width(ui.available_width())
                         .selected_text(
@@ -290,7 +378,7 @@ impl eframe::App for App {
                 }
                 let enabled = selected.as_ref().is_some_and(|a| a.supported())
                     && self.receiver.is_none()
-                    && self.confirm.is_none();
+                    && !confirming;
                 ui.add_space(16.0);
                 egui::Frame::group(ui.style())
                     .inner_margin(14.0)
@@ -308,12 +396,40 @@ impl eframe::App for App {
                     }
                     if ui
                         .add_enabled(
-                            self.receiver.is_none() && self.confirm.is_none(),
+                            self.receiver.is_none() && !confirming,
                             egui::Button::new("保存日志…"),
                         )
                         .clicked()
                     {
                         self.save();
+                    }
+                });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let label = match self.auto_state {
+                        Some(s) if s.paused => "自动应用：已暂停（请查看日志）",
+                        Some(s) if s.running => "自动应用：正在处理",
+                        Some(s) if s.installed => "自动应用：已安装",
+                        Some(_) => "自动应用：关闭",
+                        None => "自动应用：状态未知",
+                    };
+                    ui.label(label)
+                        .on_hover_text("刷新可重新读取服务状态；保存日志会包含自动执行记录。");
+                    if let Some(state) = self.auto_state {
+                        let text = if state.installed {
+                            "关闭并卸载…"
+                        } else {
+                            "开启…"
+                        };
+                        if ui
+                            .add_enabled(
+                                self.receiver.is_none() && !confirming,
+                                egui::Button::new(text),
+                            )
+                            .clicked()
+                        {
+                            self.confirm_auto = Some(!state.installed);
+                        }
                     }
                 });
                 if self.uncertain {
@@ -323,23 +439,23 @@ impl eframe::App for App {
                     );
                 }
                 ui.add_space(12.0);
-                ui.collapsing("详细日志", |ui| {
-                    egui::ScrollArea::vertical()
-                        .max_height(ui.available_height().max(40.0))
-                        .stick_to_bottom(true)
-                        .show(ui, |ui| {
-                            ui.add(
-                                egui::TextEdit::multiline(&mut self.log)
-                                    .font(egui::TextStyle::Monospace)
-                                    .desired_width(f32::INFINITY)
-                                    .interactive(false),
-                            );
-                        });
-                });
+                egui::CollapsingHeader::new("详细日志")
+                    .id_salt("expanded-execution-log")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .max_height(ui.available_height().max(40.0))
+                            .stick_to_bottom(true)
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut self.log)
+                                        .font(egui::TextStyle::Monospace)
+                                        .desired_width(f32::INFINITY)
+                                        .interactive(false),
+                                );
+                            });
+                    });
             });
-        if self.receiver.is_some() {
-            ctx.request_repaint_after(Duration::from_millis(100));
-        }
         if let Some(adapter) = self.confirm.clone() {
             egui::Modal::new(egui::Id::new("confirm-us")).show(ctx, |ui| {
                 ui.set_max_width(420.0);
@@ -355,6 +471,35 @@ impl eframe::App for App {
                     if ui.button("确认，仅执行一次").clicked() { self.start(adapter.clone(),true); }
                 });
             });
+        }
+        if let Some(install) = self.confirm_auto {
+            egui::Modal::new(egui::Id::new("confirm-auto")).show(ctx, |ui| {
+                ui.set_max_width(430.0);
+                ui.heading(if install { "开启自动应用？" } else { "关闭并卸载自动应用？" });
+                ui.label(if install {
+                    "将安装 Windows 服务，对本机所有 Steam Frame 适配器在开机、插入时自动设置 US。安装后立即检查，处理结束退出；结果不确定会暂停。未验证驱动也会尝试操作。需要管理员权限。"
+                } else {
+                    "将禁用并移除自动应用服务和安装副本。程序旁的 logs 目录会保留，不会撤销当前 US 设置。"
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("取消").clicked() { self.confirm_auto = None; }
+                    if ui.button("确认").clicked() { self.set_auto(install); }
+                });
+            });
+        }
+        if let Some(message) = self.error_popup.clone() {
+            egui::Modal::new(egui::Id::new("operation-error")).show(ctx, |ui| {
+                ui.set_max_width(430.0);
+                ui.heading("自动应用配置失败");
+                ui.label(message);
+                if ui.button("知道了").clicked() {
+                    self.error_popup = None;
+                }
+            });
+        }
+        // Modal buttons can start a worker during this frame; schedule after them.
+        if self.receiver.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(100));
         }
     }
 }
@@ -408,6 +553,12 @@ fn demo_adapter() -> Adapter {
 }
 fn main() -> eframe::Result {
     let args: Vec<_> = std::env::args().skip(1).collect();
+    if args == ["--service"] {
+        if service::dispatch().is_err() {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     if args == ["--list"] {
         match backend::enumerate() {
             Ok(items) => {
@@ -425,7 +576,7 @@ fn main() -> eframe::Result {
     if !args.is_empty() && args != ["--demo"] {
         rfd::MessageDialog::new()
             .set_title("参数错误")
-            .set_description("仅支持无参数启动、--demo 演示、--list 只读枚举。没有命令行设置入口。")
+            .set_description("支持无参数启动、--demo 演示、--list 只读枚举；--service 仅由 Windows 服务管理器调用。")
             .show();
         return Ok(());
     }
@@ -436,7 +587,7 @@ fn main() -> eframe::Result {
             viewport: egui::ViewportBuilder::default()
                 // Empty icon suppresses eframe's logo; leave the Windows default.
                 .with_icon(egui::IconData::default())
-                .with_inner_size([620.0, 410.0])
+                .with_inner_size([620.0, 500.0])
                 .with_min_inner_size([500.0, 370.0]),
             ..Default::default()
         },
@@ -447,6 +598,54 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod ui_tests {
     use super::*;
+    #[test]
+    fn auto_apply_requires_explicit_action_and_demo_never_installs() {
+        let mut app = App {
+            adapters: vec![],
+            selected: None,
+            receiver: None,
+            status: String::new(),
+            log: String::new(),
+            confirm: None,
+            uncertain: false,
+            demo: true,
+            auto_state: Some(service::State::default()),
+            confirm_auto: None,
+            error_popup: None,
+        };
+        app.poll();
+        assert!(!app.auto_state.unwrap().installed);
+        assert!(app.receiver.is_none());
+        for install in [true, false] {
+            app.confirm_auto = Some(install);
+            app.set_auto(install);
+            let event = app
+                .receiver
+                .take()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap();
+            let Event::AutoApply(message, state) = event else {
+                panic!("expected demo service action")
+            };
+            assert!(message.unwrap().contains("未修改系统"));
+            assert_eq!(state.unwrap().installed, install);
+            assert!(app.confirm_auto.is_none());
+        }
+        let (tx, rx) = mpsc::channel();
+        app.receiver = Some(rx);
+        let message = "权限不足：请以管理员身份运行".to_string();
+        tx.send(Event::AutoApply(
+            Err(message.clone()),
+            Ok(service::State::default()),
+        ))
+        .unwrap();
+        app.poll();
+        assert_eq!(app.error_popup.as_deref(), Some(message.as_str()));
+        assert!(app.status.contains("管理员"));
+        assert!(app.log.contains(&message));
+        assert!(app.receiver.is_none());
+    }
     #[test]
     fn selection_queries_once_without_setting_us() {
         for count in 0..=2 {
@@ -460,6 +659,9 @@ mod ui_tests {
                 confirm: None,
                 uncertain: false,
                 demo: true,
+                auto_state: None,
+                confirm_auto: None,
+                error_popup: None,
             };
             let items = (0..count)
                 .map(|i| {
@@ -469,7 +671,10 @@ mod ui_tests {
                     a
                 })
                 .collect();
-            assert!(tx.send(Event::Devices(Ok(items))).is_ok());
+            assert!(
+                tx.send(Event::Devices(Ok(items), Ok(service::State::default())))
+                    .is_ok()
+            );
             app.poll();
             assert_eq!(app.selected, (count == 1).then_some(0));
             assert_eq!(app.receiver.is_some(), count == 1);
