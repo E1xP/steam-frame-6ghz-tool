@@ -30,6 +30,18 @@
 - 使用时关闭其他适配器诊断工具。操作失败或结果不确定时，先查看日志，稍后刷新查询。
 - 仅用于授权的屏蔽实验环境。设置 US 会改变无线运行策略，请遵守所在地无线电规定。
 
+## Frame 头显自动恢复 US
+
+仓库内的 `scripts/frame-regdom.sh` 可安装到 Frame 的 NetworkManager：每次 `wlan0` 连接前执行一次 `iw reg set US`。这只恢复头显的运行时设置，不修改 Windows USB 适配器，也不写入固件。
+
+在 Frame 上直接安装，无需先复制脚本（仓库需公开，且本次修改需已推送到 `main`）：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/toorux/steam-frame-6ghz-tool/main/scripts/frame-regdom.sh | sudo sh -s -- install
+```
+
+其他机器可经 SSH 让 Frame 执行同一命令，例如 `ssh -tt steamos@frame 'curl -fsSL https://raw.githubusercontent.com/toorux/steam-frame-6ghz-tool/main/scripts/frame-regdom.sh | sudo sh -s -- install'`（`frame` 可换成 IP 地址）。将末尾的 `install` 改为 `status` 可查看当前国家码，改为 `remove` 可卸载。安装后建议重启 Frame 并复查；重新运行安装命令即可更新脚本。无需 PM2 或额外服务。
+
 ## 构建
 
 安装 Rust MSVC 工具链、Visual Studio C++ Build Tools 和 Windows SDK 后执行：
