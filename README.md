@@ -30,17 +30,23 @@
 - 使用时关闭其他适配器诊断工具。操作失败或结果不确定时，先查看日志，稍后刷新查询。
 - 仅用于授权的屏蔽实验环境。设置 US 会改变无线运行策略，请遵守所在地无线电规定。
 
-## Frame 头显自动恢复 US
+## Windows 已设为 US 仍无法连接 Frame
 
-仓库内的 `scripts/frame-regdom.sh` 可安装到 Frame 的 NetworkManager：每次 `wlan0` 连接前执行一次 `iw reg set US`。这只恢复头显的运行时设置，不修改 Windows USB 适配器，也不写入固件。
-
-在 Frame 上直接安装，无需先复制脚本（仓库需公开，且本次修改需已推送到 `main`）：
+Windows USB 适配器和 Frame 头显各有独立的无线国家码。若 Windows 已设为 US 仍无法配对，在 Frame 上运行 `iw reg get`；如果显示 CN，可尝试以下设置：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/toorux/steam-frame-6ghz-tool/main/scripts/frame-regdom.sh | sudo sh -s -- install
+sudo sed -i 's/^#WIRELESS_REGDOM="US"$/WIRELESS_REGDOM="US"/' /etc/conf.d/wireless-regdom
+grep -n '^WIRELESS_REGDOM=' /etc/conf.d/wireless-regdom
 ```
 
-其他机器可经 SSH 让 Frame 执行同一命令，例如 `ssh -tt steamos@frame 'curl -fsSL https://raw.githubusercontent.com/toorux/steam-frame-6ghz-tool/main/scripts/frame-regdom.sh | sudo sh -s -- install'`（`frame` 可换成 IP 地址）。将末尾的 `install` 改为 `status` 可查看当前国家码，改为 `remove` 可卸载。安装后建议重启 Frame 并复查；重新运行安装命令即可更新脚本。无需 PM2 或额外服务。
+确认 `grep` 只显示一条 `WIRELESS_REGDOM="US"` 后执行 `sudo reboot`。重启后再用 `iw reg get` 确认全局和 `phy#0` 均为 US，然后重新配对。此方法已在一台 Frame 上验证，但不修改芯片固件。
+
+恢复原配置：
+
+```sh
+sudo sed -i 's/^WIRELESS_REGDOM="US"$/#WIRELESS_REGDOM="US"/' /etc/conf.d/wireless-regdom
+sudo reboot
+```
 
 ## 构建
 
