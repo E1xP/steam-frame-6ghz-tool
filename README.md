@@ -2,7 +2,7 @@
 
 用于查看 Steam Frame USB 适配器的国家码和 6 GHz 状态，并将运行地区设置为 US。
 
-不涉及驱动逆向，也不会修改驱动文件，仅适用于 Windows。
+不涉及驱动逆向，也不会修改驱动文件，仅适用于 Windows，Linux可以直接执行 `sudo iw reg set US`。
 
 ## 使用
 
